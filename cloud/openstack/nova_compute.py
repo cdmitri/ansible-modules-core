@@ -23,8 +23,11 @@ import os
 try:
     from novaclient.v1_1 import client as nova_client
     from novaclient.v1_1 import floating_ips 
+    from novaclient.v1_1.client import Client
     from novaclient import exceptions
     from novaclient import utils
+    from keystoneclient.auth.identity import v2
+    from keystoneclient import session
     import time
 except ImportError:
     print("failed=True msg='novaclient is required for this module'")
@@ -172,7 +175,7 @@ requirements: ["novaclient"]
 '''
 
 EXAMPLES = '''
-# Creates a new VM and attaches to a network and passes metadata to the instance
+# Creates a new VM, attaches to a network, creates block storage and passes metadata to the instance
 - nova_compute:
        state: present
        login_username: admin
@@ -185,6 +188,15 @@ EXAMPLES = '''
        flavor_id: 4
        nics:
          - net-id: 34605f38-e52a-25d2-b6ec-754a13ffb723
+       volumes:
+         - display_name: vm1-vol1
+           device_name: /dev/vdb
+           volume_size: 10
+           delete_on_termination: true
+         - display_name: vm1-vol2
+           device_name: /dev/vdc
+           volume_size: 20
+           delete_on_termination: false
        meta:
          hostname: test1
          group: uge_master
@@ -271,19 +283,51 @@ EXAMPLES = '''
 def _delete_server(module, nova):
     name = None
     server_list = None
+    volume_list = None
+    volume_delete_list = []
     try:
+        nova.client.service_type = "compute"
         server_list = nova.servers.list(True, {'name': module.params['name']})
         if server_list:
-            server = [x for x in server_list if x.name == module.params['name']]
-            nova.servers.delete(server.pop())
+            servers = [x for x in server_list if x.name == module.params['name']]
+            if servers:
+                server = servers[0]
     except Exception, e:
-        module.fail_json( msg = "Error in deleting vm: %s" % e.message)
+        module.fail_json(msg = "Error in getting the server list: %s" % e.message)
+
+    
+    try:
+        nova.client.service_type = "volume"
+        volume_list = nova.volumes.list(True, {'server_id': server.id})
+        
+        if module.params['volumes']:
+            for volume_cfg in module.params['volumes']: 
+                volume_found_list = [x for x in volume_list if x.display_name == volume_cfg[
+'display_name']
+                                     and x.size == volume_cfg['volume_size']
+                                     and volume_cfg.get('delete_on_termination') == True]
+
+                if volume_found_list:
+                    volume_delete_list.append(volume_found_list[0])
+    except Exception, e:
+        module.fail_json(msg = "Error in getting the volume list: %s" % e.message)
+
     if module.params['wait'] == 'no':
         module.exit_json(changed = True, result = "deleted")
+    try:
+        nova.client.service_type = "compute"
+        nova.servers.delete(server)
+    except Exception, e:
+        module.fail_json( msg = "Error in deleting vm: %s" % e.message)
+
     expire = time.time() + int(module.params['wait_for'])
     while time.time() < expire:
+        nova.client.service_type = "compute"
         name = nova.servers.list(True, {'name': module.params['name']})
         if not name:
+            nova.client.service_type = "volume"
+            for volume in volume_delete_list:
+                nova.volumes.delete(volume)
             module.exit_json(changed = True, result = "deleted")
         time.sleep(5)
     module.fail_json(msg = "Timed out waiting for server to get deleted, please check manually")
@@ -439,25 +483,32 @@ def _create_server(module, nova):
                     module.fail_json( msg = "Error in getting info from instance: %s" % e.message)
             if server.status == 'ACTIVE':
                 server = _add_floating_ip(module, nova, server)
-
-                private = openstack_find_nova_addresses(getattr(server, 'addresses'), 'fixed', 'private')
-                public = openstack_find_nova_addresses(getattr(server, 'addresses'), 'floating', 'public')
-
-                # now exit with info 
-                module.exit_json(changed = True, id = server.id, private_ip=''.join(private), public_ip=''.join(public), status = server.status, info = server._info)
+                break
 
             if server.status == 'ERROR':
                 module.fail_json(msg = "Error in creating the server, please check logs")
             time.sleep(2)
+    
+        if server.status != 'ACTIVE':
+            module.fail_json(msg = "Timeout waiting for the server to come up.. Please check manually")
 
-        module.fail_json(msg = "Timeout waiting for the server to come up.. Please check manually")
     if server.status == 'ERROR':
             module.fail_json(msg = "Error in creating the server.. Please check manually")
+
+    # cdmitri: volumes
+    if module.params['volumes']:
+        for volume_cfg in module.params['volumes']: 
+            if 'display_name' not in volume_cfg:
+                module.fail_json(msg = 'Device name must be set for volume')
+            if 'volume_size' not in volume_cfg:
+                module.fail_json(msg = 'Size name must be set for volume')
+            volume = _create_block_device(module, nova, volume_cfg)
+            volume = _attach_block_device(module, nova, server, volume, volume_cfg)
+
     private = openstack_find_nova_addresses(getattr(server, 'addresses'), 'fixed', 'private')
     public = openstack_find_nova_addresses(getattr(server, 'addresses'), 'floating', 'public')
 
-    module.exit_json(changed = True, id = info['id'], private_ip=''.join(private), public_ip=''.join(public), status = server.status, info = server._info)
-
+    module.exit_json(changed = True, id = server.id, private_ip=''.join(private), public_ip=''.join(public), status = server.status, info = server._info)
 
 def _delete_floating_ip_list(module, nova, server, extra_ips):
     for ip in extra_ips:
@@ -510,6 +561,9 @@ def _get_server_state(module, nova):
         if server.status != 'ACTIVE':
             module.fail_json( msg="The VM is available but not Active. state:" + server.status)
         (ip_changed, server) = _check_floating_ips(module, nova, server)
+
+        _get_volume_state(module, nova, server)
+
         private = openstack_find_nova_addresses(getattr(server, 'addresses'), 'fixed', 'private')
         public = openstack_find_nova_addresses(getattr(server, 'addresses'), 'floating', 'public')
         module.exit_json(changed = ip_changed, id = server.id, public_ip = ''.join(public), private_ip = ''.join(private), info = server._info)
@@ -519,7 +573,93 @@ def _get_server_state(module, nova):
         module.exit_json(changed = False, result = "not present")
     return True
 
+def _get_volume_state(module, nova, server):
+    volume = None
 
+    try:
+        nova.client.service_type = "volume"
+        volume_list = nova.volumes.list(True, {'server_id': server.id})
+    except Exception, e:
+        module.fail_json(msg = "Error in getting the volume list: %s" % e.message)
+
+    if module.params['volumes']:
+        for volume_cfg in module.params['volumes']: 
+            if 'display_name' not in volume_cfg:
+                module.fail_json(msg = 'Device name must be set for volume')
+            if 'volume_size' not in volume_cfg:
+                module.fail_json(msg = 'Size must be set for volume')
+            volume_found_list = [x for x in volume_list if x.display_name == volume_cfg[
+'display_name']
+                                 and x.size == volume_cfg['volume_size']]
+            if volume_found_list:
+                volume = volume_found_list[0]
+
+            if module.params['state'] == 'present':
+                if not volume:
+                    module.fail_json( msg="Volume was not found: " + volume_cfg['display_name'])
+                elif volume.status != 'in-use':
+                    module.fail_json( msg="Volume was found, but not in use: " + volume_cfg['display_name'])
+
+            if volume and module.params['state'] == 'absent':
+                return True
+            if module.params['state'] == 'absent':
+                module.exit_json(changed = False, result = "not present")
+
+    return True
+
+def _create_block_device(module, nova, volume):
+
+    nova.client.service_type = "volume"
+
+    new_volume = nova.volumes.create(size=volume['volume_size'], display_name=volume['display_name'])
+
+    # cdmitri: use the same setting for volume waits as for server
+    if module.params['wait'] == 'yes':
+        expire = time.time() + int(module.params['wait_for'])
+        while time.time() < expire:
+            try:
+                new_volume = nova.volumes.get(new_volume.id)
+            except Exception, e:
+                module.fail_json( msg = "Error in getting info from volume: %s" % e.message)
+            if new_volume.status == 'available':
+                break
+            if new_volume.status == 'error':
+                module.fail_json(msg = "Error in creating the volume, please check logs")
+            time.sleep(1)
+        if new_volume.status != 'available':
+           module.fail_json(msg = "Timeout waiting for the volume to come up.. Please check manually")
+    if new_volume.status == 'error':
+        module.fail_json(msg = "Error in creating the volume.. Please check manually")
+    return new_volume
+
+
+def _attach_block_device(module, nova, server, volume, volume_cfg):
+
+    nova.client.service_type = "compute"
+
+    volume = nova.volumes.create_server_volume(server.id, volume.id, volume_cfg['device_name'])
+
+    # cdmitri: Need to switch back to volume in order to get status
+    nova.client.service_type = "volume"
+
+    # cdmitri: use the same setting for volume waits as for server
+    if module.params['wait'] == 'yes':
+        expire = time.time() + int(module.params['wait_for'])
+        while time.time() < expire:
+            try:
+                volume = nova.volumes.get(volume.id)
+            except Exception, e:
+                module.fail_json( msg = "Error in getting info from attached volume: %s" % e.message)
+            if volume.status == 'in-use':
+                break
+            if volume.status == 'error':
+                module.fail_json(msg = "Error in attaching the volume, please check logs")
+            time.sleep(1)
+        if volume.status != 'in-use':
+           module.fail_json(msg = "Timeout waiting for the volume to come up.. Please check manually")
+    if volume.status == 'error':
+        module.fail_json(msg = "Error in attaching the volume.. Please check manually")
+    return volume
 
 def main():
     argument_spec = openstack_argument_spec()
@@ -543,6 +683,7 @@ def main():
         auto_floating_ip                = dict(default=False, type='bool'),
         floating_ips                    = dict(default=None),
         floating_ip_pools               = dict(default=None),
+        volumes                         = dict(default=None, type='list'),
     ))
     module = AnsibleModule(
         argument_spec=argument_spec,
@@ -555,14 +696,15 @@ def main():
         ],
     )
 
-    nova = nova_client.Client(module.params['login_username'],
-                              module.params['login_password'],
-                              module.params['login_tenant_name'],
-                              module.params['auth_url'],
-                              region_name=module.params['region_name'],
-                              service_type='compute')
+    auth = v2.Password(auth_url=module.params['auth_url'],
+                       username=module.params['login_username'],
+                       password=module.params['login_password'],
+                       tenant_name=module.params['login_tenant_name'])
+
+    sess = session.Session(auth=auth)
+
     try:
-        nova.authenticate()
+        nova = Client(session=sess,region_name=module.params['region_name'])
     except exceptions.Unauthorized, e:
         module.fail_json(msg = "Invalid OpenStack Nova credentials.: %s" % e.message)
     except exceptions.AuthorizationFailure, e:
